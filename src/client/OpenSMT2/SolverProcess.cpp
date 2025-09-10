@@ -240,20 +240,25 @@ void SolverProcess::partition(PTPLib::net::SMTS_Event & SMTS_Event, uint8_t n) {
         try {
             getScatterSplitter().setSplitTypeScatter();
             sstat status = getMainSplitter().solve();
-            if (status == s_Undef) {
+            //+ TODO: Handle the unsat case more efficiently - use the information!
+            if (status == s_Undef or status == s_False) {
                 partitions = getMainSplitter().getPartitionClauses();
                 net::Report::report(get_SMTS_socket(), partitions, to_string(searchCounter), statusInfo, SMTS_Event);
             }
+            // TK: For sat, we can conclude sat for the original formula
             else if (status == s_True) {
                 synced_stream.println_bold(log_enabled ? PTPLib::common::Color::FG_Red : PTPLib::common::Color::FG_DEFAULT,
                                            "[ t ", __func__, "] -> ", " Partition Report sat ", SMTS_Event.header.at(PTPLib::common::Param.NODE));
                 net::Report::report(get_SMTS_socket(), SMTS_Event.header, SolverProcess::resultToString( Result::SAT));
             }
+            // TK: Wrong! It should mean that the *negation* is unsat, not this node!
+            /*
             else if (status == s_False) {
                 synced_stream.println_bold(log_enabled ? PTPLib::common::Color::FG_Red : PTPLib::common::Color::FG_DEFAULT,
                                            "[ t ", __func__, "] -> ", " Partition Report unsat ", SMTS_Event.header.at(PTPLib::common::Param.NODE));
                 net::Report::report(get_SMTS_socket(), SMTS_Event.header, SolverProcess::resultToString( Result::UNSAT));
             }
+            */
             else {
                 net::Report::report(get_SMTS_socket(), partitions, to_string(searchCounter), statusInfo, SMTS_Event, "error during partitioning");
             }

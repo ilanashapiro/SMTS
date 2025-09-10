@@ -537,6 +537,7 @@ class ParallelizationServer(net.Server):
                     #     node.status = framework.SolveStatus.__members__[header[constant.REPORT]]
                     #     print('       solved solver in forked -> ', solver)
                     #     return
+                    assert node.status != framework.SolveStatus.sat
                     if node.status == framework.SolveStatus.unsat:
                         if node.parent:
                             if node.parent.parent.status == framework.SolveStatus.unknown:
