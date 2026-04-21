@@ -10,9 +10,12 @@ else(OpenSMT_FOUND)
 
     set(solver_type ${solver})
     if(NOT solver_type)
-        set(PARALLEL ON CACHE INTERNAL "")
         set(solver_type OpenSMT2)
         message(STATUS "Solver Type is set to OpenSMT2 by default.")
+    endif()
+
+    if(solver_type STREQUAL "OpenSMT2" OR solver_type STREQUAL "OpenSMTZ3Hybrid")
+        set(PARALLEL ON CACHE INTERNAL "")
     endif()
 
     if(NOT osmt_repo)
