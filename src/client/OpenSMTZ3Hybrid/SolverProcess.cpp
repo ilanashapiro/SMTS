@@ -29,11 +29,16 @@
 #include <csignal>
 #include <iostream>
 #include <cctype>
+#include <limits.h>
 #include <string>
 #include <vector>
 
 #ifdef __linux__
 #include <sys/prctl.h>
+#endif
+
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
 #endif
 
 using opensmt::SMTConfig;
@@ -68,6 +73,24 @@ struct Z3Proc {
 
 static Z3Proc z3proc;
 
+static std::string siblingExecutablePath(char const * name) {
+    char path[PATH_MAX] = {};
+#ifdef __linux__
+    ssize_t len = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (len <= 0) return {};
+    path[len] = '\0';
+#elif defined(__APPLE__)
+    uint32_t size = sizeof(path);
+    if (_NSGetExecutablePath(path, &size) != 0) return {};
+#else
+    return {};
+#endif
+    std::string executable(path);
+    size_t slash = executable.find_last_of('/');
+    if (slash == std::string::npos) return {};
+    return executable.substr(0, slash + 1) + name;
+}
+
 static bool z3_send(const std::string & cmd) {
     if (!z3proc.valid()) return false;
     const char * s = cmd.c_str();
@@ -80,18 +103,31 @@ static bool z3_send(const std::string & cmd) {
     return true;
 }
 
-static SolverProcess::Result z3_read_result() {
+static SolverProcess::Result z3_read_result(
+        PTPLib::net::Channel<PTPLib::net::SMTS_Event, PTPLib::net::Lemma> & channel) {
     if (!z3proc.stdout_fp) return SolverProcess::Result::ERROR;
-    char buf[64] = {};
-    if (!fgets(buf, sizeof(buf), z3proc.stdout_fp))
-        return SolverProcess::Result::ERROR;
-    size_t len = strlen(buf);
-    while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r' || buf[len-1] == ' '))
-        buf[--len] = '\0';
-    if (strcmp(buf, "sat")   == 0) return SolverProcess::Result::SAT;
-    if (strcmp(buf, "unsat") == 0) return SolverProcess::Result::UNSAT;
-    if (strncmp(buf, "(error", 6) == 0) return SolverProcess::Result::ERROR;
-    return SolverProcess::Result::UNKNOWN;
+    char buf[8192] = {};
+    while (fgets(buf, sizeof(buf), z3proc.stdout_fp)) {
+        size_t len = strlen(buf);
+        while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r' || buf[len-1] == ' '))
+            buf[--len] = '\0';
+
+        static char const * lemmaPrefix = "smts-lemma ";
+        static char const * errorPrefix = "smts-error ";
+        if (strncmp(buf, lemmaPrefix, strlen(lemmaPrefix)) == 0) {
+            std::vector<PTPLib::net::Lemma> lemmas;
+            lemmas.emplace_back(buf + strlen(lemmaPrefix), 0);
+            std::unique_lock<std::mutex> lk(channel.getMutex());
+            channel.insert_learned_clause(std::move(lemmas));
+            continue;
+        }
+        if (strncmp(buf, errorPrefix, strlen(errorPrefix)) == 0) return SolverProcess::Result::ERROR;
+        if (strcmp(buf, "sat") == 0) return SolverProcess::Result::SAT;
+        if (strcmp(buf, "unsat") == 0) return SolverProcess::Result::UNSAT;
+        if (strcmp(buf, "unknown") == 0) return SolverProcess::Result::UNKNOWN;
+        if (strncmp(buf, "(error", 6) == 0) return SolverProcess::Result::ERROR;
+    }
+    return SolverProcess::Result::ERROR;
 }
 
 static bool launch_z3() {
@@ -120,7 +156,14 @@ static bool launch_z3() {
         close(from_z3[0]); close(from_z3[1]);
         int devnull = open("/dev/null", O_WRONLY);
         if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
-        execlp("z3", "z3", "-in", (char*)nullptr);
+        std::string siblingProxy = siblingExecutablePath("z3_smts_proxy");
+        char const * proxy = getenv("SMTS_Z3_PROXY");
+        if (!siblingProxy.empty())
+            execl(siblingProxy.c_str(), "z3_smts_proxy", (char*)nullptr);
+        if (proxy && proxy[0])
+            execlp(proxy, "z3_smts_proxy", (char*)nullptr);
+        else
+            execlp("z3_smts_proxy", "z3_smts_proxy", (char*)nullptr);
         _exit(1); // exec failed
     }
     // parent — keep our ends only
@@ -397,7 +440,7 @@ SolverProcess::Result SolverProcess::solve(PTPLib::net::SMTS_Event SMTS_event, b
         net::Report::error(get_SMTS_socket(), SMTS_event.header, "Z3 subprocess write error during check-sat");
         return SolverProcess::Result::ERROR;
     }
-    z3_last_result = z3_read_result();
+    z3_last_result = z3_read_result(getChannel());
     return z3_last_result;
 }
 
