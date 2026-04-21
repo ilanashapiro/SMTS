@@ -34,6 +34,7 @@ if __name__ == '__main__':
     lg.add_argument('-r', dest='lemma_resend', action='store_true', help='send same lemmas multiple times to solver')
     sg = parser.add_argument_group('solvers')
     sg.add_argument('-o', dest='opensmt', type=int, metavar='N', help='run N opensmt2 solvers')
+    sg.add_argument('-oz', dest='opensmt_z3', type=int, metavar='N', help='run N opensmt/z3 hybrid solvers')
     sg.add_argument('-z', dest='z3spacer', type=int, metavar='N', help='run N z3spacer solvers')
     sg.add_argument('-s', dest='sally', type=int, metavar='N', help='run N sally solvers')
     sg.add_argument('-pn', dest='port', type=int, metavar='N', help='port number')
@@ -68,6 +69,8 @@ if __name__ == '__main__':
         schedular.config.lemma_resend = args.lemma_resend
     if args.opensmt:
         schedular.config.opensmt = args.opensmt
+    if args.opensmt_z3:
+        schedular.config.opensmt_z3 = args.opensmt_z3
     if args.z3spacer:
         schedular.config.z3spacer = args.z3spacer
     if args.sally:
@@ -105,9 +108,10 @@ if __name__ == '__main__':
         lemma_thread.daemon = True
         lemma_thread.start()
 
-    if schedular.config.opensmt or schedular.config.z3spacer or schedular.config.sally:
+    if schedular.config.opensmt or schedular.config.opensmt_z3 or schedular.config.z3spacer or schedular.config.sally:
         utils.run_solvers(
             (schedular.config.build_path + '/solver_opensmt', schedular.config.opensmt, port),
+            (schedular.config.build_path + '/solver_opensmt_z3', schedular.config.opensmt_z3, port),
             (schedular.config.build_path + '/solver_z3spacer', schedular.config.z3spacer, port),
             (schedular.config.build_path + '/solver_sally', schedular.config.sally, port)
         )

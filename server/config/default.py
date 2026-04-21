@@ -22,6 +22,7 @@ fixedpoint_partition = False    # automatic partition for fixedpoint instances
 files_path = []                 # list of files path absolute or relative to the config file, to be loaded at server startup
 gui = False                     # enable GUI
 opensmt = 0                     # number of opensmt2 processes
+opensmt_z3 = 0                  # number of opensmt/z3 hybrid processes
 z3spacer = 0                    # number of z3spacer processes
 sally = 0                       # number of sally processes
 idle_quit = True                # quit smts after solving the last instance
@@ -48,6 +49,8 @@ spit_preference = False
 parameters = {
     "OpenSMT2.seed": lambda: random.randint(0, 0xFFFFFF),
     "OpenSMT2.split-type": ":scatter-split",
+    "OpenSMTZ3.seed": lambda: random.randint(0, 0xFFFFFF),
+    "OpenSMTZ3.split-type": ":scatter-split",
     "Spacer.fp.spacer.random_seed": lambda: random.randint(0, 0xFFFFFF),
     "Spacer.fp.spacer.restarts": "false",
     "Spacer.fp.spacer.p3.share_lemmas": "true",
