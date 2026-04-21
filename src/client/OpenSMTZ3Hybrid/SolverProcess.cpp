@@ -4,13 +4,14 @@
  * - Z3 runs as a subprocess, receiving SMT-LIB2 via pipe, for solving.
  *
  * Isolating Z3 into its own process prevents mutex deadlocks caused by
- * fork()-ing a process that holds a live z3::context.  Z3's incremental
- * state (push/pop/assert stack) is maintained across cubes because the
- * subprocess persists for the lifetime of the worker.
+ * fork()-ing a process that holds a live z3::context.  Z3's solver process
+ * persists for the lifetime of the worker and mirrors OpenSMT's frame-literal
+ * assertion stack so partition assertions and learned clauses can survive
+ * relocation.
  *
- * Lemma sharing works correctly: OpenSMT serialises learned clauses via
- * removeAuxVars() + dumpWithLets(), producing standard SMT-LIB2 over
- * the original theory atoms, which Z3 can assert directly.
+ * Lemma sharing uses Z3's clause callback.  The proxy strips SMTS frame
+ * literals and computes the same tree level that OpenSMT's ScatterSplitter
+ * computes before inserting lemmas into the unchanged SMTS channel.
  */
 
 #include "client/SolverProcess.h"
@@ -20,13 +21,16 @@
 #include <parallel/SplitterInterpret.h>
 #include <common/ReportUtils.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/select.h>
 #include <sys/wait.h>
 #include <csignal>
+#include <cerrno>
 #include <iostream>
 #include <cctype>
 #include <limits.h>
@@ -106,19 +110,66 @@ static bool z3_send(const std::string & cmd) {
 static SolverProcess::Result z3_read_result(
         PTPLib::net::Channel<PTPLib::net::SMTS_Event, PTPLib::net::Lemma> & channel) {
     if (!z3proc.stdout_fp) return SolverProcess::Result::ERROR;
+    std::vector<PTPLib::net::Lemma> pendingLemmas;
+    auto flushPendingLemmas = [&]() {
+        if (!channel.isClauseShareMode() || !channel.shouldLearnClauses()) {
+            return;
+        }
+        channel.clearShouldLearnClauses();
+        if (pendingLemmas.empty()) return;
+        std::unique_lock<std::mutex> lk(channel.getMutex());
+        channel.insert_learned_clause(std::move(pendingLemmas));
+        pendingLemmas.clear();
+    };
+
     char buf[8192] = {};
-    while (fgets(buf, sizeof(buf), z3proc.stdout_fp)) {
+    int outFd = fileno(z3proc.stdout_fp);
+    while (true) {
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(outFd, &readSet);
+        timeval timeout{0, 200000};
+        int ready = select(outFd + 1, &readSet, nullptr, nullptr, &timeout);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return SolverProcess::Result::ERROR;
+        }
+        if (ready == 0) {
+            flushPendingLemmas();
+            continue;
+        }
+        if (!fgets(buf, sizeof(buf), z3proc.stdout_fp)) break;
         size_t len = strlen(buf);
         while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r' || buf[len-1] == ' '))
             buf[--len] = '\0';
 
         static char const * lemmaPrefix = "smts-lemma ";
+        static char const * deletePrefix = "smts-delete ";
         static char const * errorPrefix = "smts-error ";
         if (strncmp(buf, lemmaPrefix, strlen(lemmaPrefix)) == 0) {
-            std::vector<PTPLib::net::Lemma> lemmas;
-            lemmas.emplace_back(buf + strlen(lemmaPrefix), 0);
-            std::unique_lock<std::mutex> lk(channel.getMutex());
-            channel.insert_learned_clause(std::move(lemmas));
+            // Protocol: "smts-lemma <depth> <clause>"
+            // depth encodes the partition-tree level at which the clause was
+            // learned; the LemmaServer uses it to scope distribution correctly.
+            const char * rest = buf + strlen(lemmaPrefix);
+            char * end;
+            long level = strtol(rest, &end, 10);
+            if (end == rest || *end != ' ') continue; // malformed, skip
+            pendingLemmas.emplace_back(std::string(end + 1), static_cast<int>(level));
+            flushPendingLemmas();
+            continue;
+        }
+        if (strncmp(buf, deletePrefix, strlen(deletePrefix)) == 0) {
+            const char * rest = buf + strlen(deletePrefix);
+            char * end;
+            long level = strtol(rest, &end, 10);
+            if (end == rest || *end != ' ') continue;
+            std::string clause(end + 1);
+            pendingLemmas.erase(
+                std::remove_if(pendingLemmas.begin(), pendingLemmas.end(),
+                    [&](PTPLib::net::Lemma const & lemma) {
+                        return lemma.level == static_cast<int>(level) && lemma.clause == clause;
+                    }),
+                pendingLemmas.end());
             continue;
         }
         if (strncmp(buf, errorPrefix, strlen(errorPrefix)) == 0) return SolverProcess::Result::ERROR;
@@ -267,8 +318,8 @@ static unsigned commandArgumentOrOne(std::string const & command) {
 
 // ── Z3 subprocess communication ──────────────────────────────────────────────
 
-// Forward SMT-LIB2 commands from script to the Z3 subprocess, translating
-// push/pop structurally and skipping solve/query commands.
+// Forward SMT-LIB2 commands from script to the Z3 proxy.  The proxy translates
+// push/pop into persistent SMTS frame literals and skips solve/query commands.
 static bool applyZ3Subprocess(net::Socket const & socket,
                                PTPLib::net::SMTS_Event & event,
                                std::string const & script) {
@@ -320,6 +371,26 @@ static opensmt::vec<opensmt::pair<int,int>> extractSolverBranch(std::string solv
 static opensmt::vec<opensmt::pair<int,int>> eventBranch(PTPLib::net::SMTS_Event const & event) {
     return extractSolverBranch(event.header.at(PTPLib::common::Param.NODE).substr(
         1, event.header.at(PTPLib::common::Param.NODE).size() - 2));
+}
+
+static std::string branchCommand(opensmt::vec<opensmt::pair<int,int>> const & branch) {
+    std::string out = "(smts-branch";
+    for (int i = 0; i < branch.size(); ++i) {
+        out += " ";
+        out += std::to_string(branch[i].first);
+        out += ":";
+        out += std::to_string(branch[i].second);
+    }
+    out += ")\n";
+    return out;
+}
+
+static bool z3_set_branch(opensmt::vec<opensmt::pair<int,int>> const & branch) {
+    return z3_send(branchCommand(branch));
+}
+
+static unsigned eventBranchDepth(PTPLib::net::SMTS_Event const & event) {
+    return static_cast<unsigned>(eventBranch(event).size());
 }
 
 inline MainSplitter & getMainSplitter() {
@@ -381,10 +452,13 @@ SolverProcess::Result SolverProcess::init(PTPLib::net::SMTS_Event & SMTS_Event) 
             to_string(get_SMTS_socket().get_local()), getpid());
     }
 
+    auto branch = eventBranch(SMTS_Event);
     auto res = splitterInterpret->interpSMTContent(
-        (char *) SMTS_Event.body.c_str(), eventBranch(SMTS_Event), false, false);
+        (char *) SMTS_Event.body.c_str(), std::move(branch), false, false);
     if (res == s_Error) return SolverProcess::Result::ERROR;
 
+    if (!z3_set_branch(eventBranch(SMTS_Event)))
+        return SolverProcess::Result::ERROR;
     if (!applyZ3Subprocess(get_SMTS_socket(), SMTS_Event, SMTS_Event.body))
         return SolverProcess::Result::ERROR;
 
@@ -419,11 +493,14 @@ SolverProcess::Result SolverProcess::solve(PTPLib::net::SMTS_Event SMTS_event, b
     assert(not SMTS_event.header.at(PTPLib::common::Param.QUERY).empty());
 
     if (SMTS_event.header.at(PTPLib::common::Param.COMMAND) == PTPLib::common::Command.INCREMENTAL) {
+        auto branch = eventBranch(SMTS_event);
         auto res = splitterInterpret->interpSMTContent(
             (char *) SMTS_event.body.c_str(),
-            eventBranch(SMTS_event), shouldUpdateSolverBranch, true);
+            std::move(branch), shouldUpdateSolverBranch, true);
         if (res == s_Error) return SolverProcess::Result::ERROR;
 
+        if (!z3_set_branch(eventBranch(SMTS_event)))
+            return SolverProcess::Result::ERROR;
         if (!applyZ3Subprocess(get_SMTS_socket(), SMTS_event, SMTS_event.body))
             return SolverProcess::Result::ERROR;
     }
@@ -436,11 +513,19 @@ SolverProcess::Result SolverProcess::solve(PTPLib::net::SMTS_Event SMTS_event, b
         base_instance.clear();
     }
 
-    if (!z3_send("(check-sat)\n")) {
+    if (!z3_set_branch(eventBranch(SMTS_event)) ||
+        !z3_send("(set-info :smts-depth " + std::to_string(eventBranchDepth(SMTS_event)) + ")\n") ||
+        !z3_send("(check-sat)\n")) {
         net::Report::error(get_SMTS_socket(), SMTS_event.header, "Z3 subprocess write error during check-sat");
         return SolverProcess::Result::ERROR;
     }
     z3_last_result = z3_read_result(getChannel());
+    if (z3_last_result == SolverProcess::Result::SAT ||
+        z3_last_result == SolverProcess::Result::UNSAT ||
+        z3_last_result == SolverProcess::Result::ERROR) {
+        getChannel().setShallStop();
+        getChannel().notify_all();
+    }
     return z3_last_result;
 }
 
@@ -530,6 +615,10 @@ void SolverProcess::kill_partition_process() {
 
 void SolverProcess::add_constraint(std::unique_ptr<PTPLib::net::map_solverBranch_lemmas> const & clauses,
                                    std::string & branch) {
+    if (!z3_send(branchCommand(extractSolverBranch(branch.substr(1, branch.size() - 2))))) {
+        PTPLib::net::Header header;
+        net::Report::warning(get_SMTS_socket(), header, "Z3 subprocess write error while setting branch for lemma injection");
+    }
     for (auto const & lemmaPulled : *clauses) {
         if (log_enabled)
             synced_stream.println(log_enabled ? PTPLib::common::Color::FG_Cyan : PTPLib::common::Color::FG_DEFAULT,
